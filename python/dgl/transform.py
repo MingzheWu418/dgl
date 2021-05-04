@@ -59,96 +59,54 @@ def pairwise_squared_distance(x):
     return x2s + F.swapaxes(x2s, -1, -2) - 2 * x @ F.swapaxes(x, -1, -2)
 
 #pylint: disable=invalid-name
-def knn_graph(x, k, algorithm='topk'):
-    """Construct a graph from a set of points according to k-nearest-neighbor (KNN)
-    and return.
+def knn_graph(x, k, extend_info=False):
+    """Transforms the given point set to a directed graph, whose coordinates
+    are given as a matrix. The predecessors of each point are its k-nearest
+    neighbors.
 
-    The function transforms the coordinates/features of a point set
-    into a directed homogeneous graph. The coordinates of the point
-    set is specified as a matrix whose rows correspond to points and
-    columns correspond to coordinate/feature dimensions.
-
-    The nodes of the returned graph correspond to the points, where the predecessors
-    of each point are its k-nearest neighbors measured by the Euclidean distance.
-
-    If :attr:`x` is a 3D tensor, then each submatrix will be transformed
-    into a separate graph. DGL then composes the graphs into a large
-    graph of multiple connected components.
+    If a 3D tensor is given instead, then each row would be transformed into
+    a separate graph.  The graphs will be unioned.
 
     Parameters
     ----------
     x : Tensor
-        The point coordinates. It can be either on CPU or GPU.
+        The input tensor.
 
-        * If is 2D, ``x[i]`` corresponds to the i-th node in the KNN graph.
+        If 2D, each row of ``x`` corresponds to a node.
 
-        * If is 3D, ``x[i]`` corresponds to the i-th KNN graph and
-          ``x[i][j]`` corresponds to the j-th node in the i-th KNN graph.
+        If 3D, a k-NN graph would be constructed for each row.  Then
+        the graphs are unioned.
     k : int
-        The number of nearest neighbors per node.
-    algorithm : str, optional
-        Algorithm used to compute the k-nearest neighbors.
-
-        * 'topk' will use topk algorithm (quick-select or sorting,
-          depending on backend implementation)
-        * 'kd-tree' will use kd-tree algorithm (only on cpu)
-
-        (default: 'topk')
+        The number of neighbors
 
     Returns
     -------
     DGLGraph
-        The constructred graph. The node IDs are in the same order as :attr:`x`.
-
-        The returned graph is on CPU, regardless of the context of input :attr:`x`.
-
-    Examples
-    --------
-
-    The following examples use PyTorch backend.
-
-    >>> import dgl
-    >>> import torch
-
-    When :attr:`x` is a 2D tensor, a single KNN graph is constructed.
-
-    >>> x = torch.tensor([[0.0, 0.0, 1.0],
-    ...                   [1.0, 0.5, 0.5],
-    ...                   [0.5, 0.2, 0.2],
-    ...                   [0.3, 0.2, 0.4]])
-    >>> knn_g = dgl.knn_graph(x, 2)  # Each node has two predecessors
-    >>> knn_g.edges()
-    >>> (tensor([0, 1, 2, 2, 2, 3, 3, 3]), tensor([0, 1, 1, 2, 3, 0, 2, 3]))
-
-    When :attr:`x` is a 3D tensor, DGL constructs multiple KNN graphs and
-    and then composes them into a graph of multiple connected components.
-
-    >>> x1 = torch.tensor([[0.0, 0.0, 1.0],
-    ...                    [1.0, 0.5, 0.5],
-    ...                    [0.5, 0.2, 0.2],
-    ...                    [0.3, 0.2, 0.4]])
-    >>> x2 = torch.tensor([[0.0, 1.0, 1.0],
-    ...                    [0.3, 0.3, 0.3],
-    ...                    [0.4, 0.4, 1.0],
-    ...                    [0.3, 0.8, 0.2]])
-    >>> x = torch.stack([x1, x2], dim=0)
-    >>> knn_g = dgl.knn_graph(x, 2)  # Each node has two predecessors
-    >>> knn_g.edges()
-    (tensor([0, 1, 2, 2, 2, 3, 3, 3, 4, 5, 5, 5, 6, 6, 7, 7]),
-     tensor([0, 1, 1, 2, 3, 0, 2, 3, 4, 5, 6, 7, 4, 6, 5, 7]))
+        The graph.  The node IDs are in the same order as ``x``.
     """
-    if algorithm == 'topk':
-        return _knn_graph_topk(x, k)
-    else:
-        if F.ndim(x) == 3:
-            x_size = tuple(F.shape(x))
-            x = F.reshape(x, (x_size[0] * x_size[1], x_size[2]))
-            x_seg = x_size[0] * [x_size[1]]
-        else:
-            x_seg = [F.shape(x)[0]]
-        out = knn(x, x_seg, x, x_seg, k, algorithm=algorithm)
-        row, col = out[1], out[0]
-        return convert.graph((row, col))
+    if F.ndim(x) == 2:
+        x = F.unsqueeze(x, 0)
+    n_samples, n_points, _ = F.shape(x)
+
+    dist = pairwise_squared_distance(x)
+    k_indices = F.argtopk(dist, k, 2, descending=False)
+    dst = F.copy_to(k_indices, F.cpu())
+
+    src = F.zeros_like(dst) + F.reshape(F.arange(0, n_points), (1, -1, 1))
+
+    per_sample_offset = F.reshape(F.arange(0, n_samples) * n_points, (-1, 1, 1))
+    dst += per_sample_offset
+    src += per_sample_offset
+    dst = F.reshape(dst, (-1,))
+    src = F.reshape(src, (-1,))
+    adj = sparse.csr_matrix((F.asnumpy(F.zeros_like(dst) + 1), (F.asnumpy(dst), F.asnumpy(src))))
+
+    g = DGLGraph(adj, readonly=True)
+
+    if extend_info:
+        return g, k_indices, dist
+    return g
+
 
 def _knn_graph_topk(x, k):
     """Construct a graph from a set of points according to k-nearest-neighbor (KNN)
